@@ -2,8 +2,8 @@
 set -euo pipefail
 
 # Patch PDBs that currently have maxUnavailable=50% and disruptionsAllowed=0,
-# and provide deterministic rollback back to original maxUnavailable and
-# unhealthyPodEvictionPolicy values.
+# and provide deterministic rollback back to original maxUnavailable,
+# unhealthyPodEvictionPolicy, and Flux reconcile annotation values.
 #
 # Suggested prod usage:
 #
@@ -16,7 +16,8 @@ set -euo pipefail
 # 3. Live apply (patch targets with auto-rollback on failure):
 #    ./pdb_disruption_patch.sh apply --run-dir runs/20260626-161407 --context cft-demo-01-aks --auto-revert-on-failure --yes
 #
-# 4. Revert (restore original maxUnavailable and unhealthyPodEvictionPolicy):
+# 4. Revert (restore original maxUnavailable, unhealthyPodEvictionPolicy,
+#    and Flux reconcile annotation):
 #    ./pdb_disruption_patch.sh revert --run-dir runs/20260626-161407 --context cft-demo-01-aks --yes
 
 usage() {
@@ -29,16 +30,18 @@ Usage:
 
 Actions:
   prepare   Build target list + backup data in a run directory.
-  apply     Patch targets from run directory to spec.maxUnavailable=1 and
-            spec.unhealthyPodEvictionPolicy=AlwaysAllow.
-  revert    Restore original spec.maxUnavailable and
-            spec.unhealthyPodEvictionPolicy from backup.
+  apply     Patch targets from run directory to spec.maxUnavailable=1,
+            spec.unhealthyPodEvictionPolicy=AlwaysAllow, and
+            metadata.annotations[kustomize.toolkit.fluxcd.io/reconcile]=disabled.
+  revert    Restore original spec.maxUnavailable,
+            spec.unhealthyPodEvictionPolicy, and Flux reconcile annotation from backup.
   status    Show current status for targets.
 
 Notes:
   - Target filter is strict: status.disruptionsAllowed < 1 at prepare time,
     and spec.maxUnavailable is < 100% (numeric or percentage string).
-  - Revert restores maxUnavailable and unhealthyPodEvictionPolicy.
+  - Revert restores maxUnavailable, unhealthyPodEvictionPolicy,
+    and annotation kustomize.toolkit.fluxcd.io/reconcile.
   - Non-dry-run apply/revert requires interactive confirmation unless --yes is set.
   - --context enforces current kube context to avoid wrong-cluster changes.
   - --auto-revert-on-failure (apply only) reverts successfully patched PDBs if any apply fails.
@@ -182,9 +185,10 @@ revert_one_target() {
   local name="$2"
   local orig="$3"
   local orig_policy="$4"
+  local orig_flux_reconcile="$5"
 
   local payload
-  payload=$(jq -cn --argjson m "$orig" --argjson p "$orig_policy" '{spec:{maxUnavailable:$m,unhealthyPodEvictionPolicy:$p}}')
+  payload=$(jq -cn --argjson m "$orig" --argjson p "$orig_policy" --argjson a "$orig_flux_reconcile" '{spec:{maxUnavailable:$m,unhealthyPodEvictionPolicy:$p},metadata:{annotations:{"kustomize.toolkit.fluxcd.io/reconcile":$a}}}')
   kubectl patch pdb "$name" -n "$ns" --type merge -p "$payload" 2>&1
 }
 
@@ -231,6 +235,7 @@ prepare() {
         name: .metadata.name,
         origMaxUnavailable: .spec.maxUnavailable,
         origUnhealthyPodEvictionPolicy: (if (.spec | has("unhealthyPodEvictionPolicy")) then .spec.unhealthyPodEvictionPolicy else null end),
+      origFluxReconcileAnnotation: (.metadata.annotations["kustomize.toolkit.fluxcd.io/reconcile"] // null),
         disruptionsAllowedAtPrepare: .status.disruptionsAllowed
       }
   ' "$backup_file" > "$targets_file"
@@ -282,29 +287,29 @@ apply_patch_targets() {
   while IFS= read -r line; do
     ns=$(echo "$line" | jq -r '.namespace')
     name=$(echo "$line" | jq -r '.name')
-    payload='{"spec":{"maxUnavailable":1,"unhealthyPodEvictionPolicy":"AlwaysAllow"}}'
+    payload='{"spec":{"maxUnavailable":1,"unhealthyPodEvictionPolicy":"AlwaysAllow"},"metadata":{"annotations":{"kustomize.toolkit.fluxcd.io/reconcile":"disabled"}}}'
     if [[ "$DRY_RUN" == "true" ]]; then
       if patch_out=$(kubectl patch pdb "$name" -n "$ns" --type merge -p "$payload" --dry-run=server 2>&1); then
         patch_out=$(single_line "$patch_out")
-        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out"
-        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out" >> "$result_file"
+        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out"
+        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out" >> "$result_file"
       else
         patch_out=$(single_line "$patch_out")
-        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out"
-        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out" >> "$result_file"
+        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out"
+        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out" >> "$result_file"
         echo "$line" >> "$failure_file"
         failed=$((failed + 1))
       fi
     else
       if patch_out=$(kubectl patch pdb "$name" -n "$ns" --type merge -p "$payload" 2>&1); then
         patch_out=$(single_line "$patch_out")
-        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out"
-        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out" >> "$result_file"
+        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out"
+        echo -e "OK\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out" >> "$result_file"
         echo "$line" >> "$success_file"
       else
         patch_out=$(single_line "$patch_out")
-        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out"
-        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow\t$patch_out" >> "$result_file"
+        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out"
+        echo -e "ERROR\t$ns\t$name\tmaxUnavailable=1,unhealthyPodEvictionPolicy=AlwaysAllow,fluxReconcile=disabled\t$patch_out" >> "$result_file"
         echo "$line" >> "$failure_file"
         failed=$((failed + 1))
       fi
@@ -324,7 +329,7 @@ apply_patch_targets() {
   fi
 
   if [[ "$DRY_RUN" != "true" && "$failed" -gt 0 && "$AUTO_REVERT_ON_FAILURE" == "true" ]]; then
-    local reverted_ok reverted_failed revert_out orig orig_policy
+    local reverted_ok reverted_failed revert_out orig orig_policy orig_flux_reconcile
     reverted_ok=0
     reverted_failed=0
     echo "Apply had failures; auto-reverting successful apply targets"
@@ -333,7 +338,8 @@ apply_patch_targets() {
       name=$(echo "$line" | jq -r '.name')
       orig=$(echo "$line" | jq -c '.origMaxUnavailable')
       orig_policy=$(echo "$line" | jq -c '.origUnhealthyPodEvictionPolicy')
-      if revert_out=$(revert_one_target "$ns" "$name" "$orig" "$orig_policy"); then
+      orig_flux_reconcile=$(echo "$line" | jq -c '.origFluxReconcileAnnotation')
+      if revert_out=$(revert_one_target "$ns" "$name" "$orig" "$orig_policy" "$orig_flux_reconcile"); then
         reverted_ok=$((reverted_ok + 1))
       else
         reverted_failed=$((reverted_failed + 1))
@@ -372,7 +378,7 @@ revert_targets() {
   : > "$result_file"
   : > "$failure_file"
 
-  local line ns name orig orig_policy payload patch_out processed failed
+  local line ns name orig orig_policy orig_flux_reconcile payload patch_out processed failed
   processed=0
   failed=0
   echo -e "RESULT\tNAMESPACE\tNAME\tTARGET\tAPI_RESPONSE"
@@ -382,14 +388,15 @@ revert_targets() {
     name=$(echo "$line" | jq -r '.name')
     orig=$(echo "$line" | jq -c '.origMaxUnavailable')
     orig_policy=$(echo "$line" | jq -c '.origUnhealthyPodEvictionPolicy')
-    if patch_out=$(revert_one_target "$ns" "$name" "$orig" "$orig_policy"); then
+    orig_flux_reconcile=$(echo "$line" | jq -c '.origFluxReconcileAnnotation')
+    if patch_out=$(revert_one_target "$ns" "$name" "$orig" "$orig_policy" "$orig_flux_reconcile"); then
       patch_out=$(single_line "$patch_out")
-      echo -e "OK\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"')\t$patch_out"
-      echo -e "OK\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"')\t$patch_out" >> "$result_file"
+      echo -e "OK\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"'),fluxReconcileAnnotation=$(echo "$orig_flux_reconcile" | tr -d '"')\t$patch_out"
+      echo -e "OK\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"'),fluxReconcileAnnotation=$(echo "$orig_flux_reconcile" | tr -d '"')\t$patch_out" >> "$result_file"
     else
       patch_out=$(single_line "$patch_out")
-      echo -e "ERROR\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"')\t$patch_out"
-      echo -e "ERROR\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"')\t$patch_out" >> "$result_file"
+      echo -e "ERROR\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"'),fluxReconcileAnnotation=$(echo "$orig_flux_reconcile" | tr -d '"')\t$patch_out"
+      echo -e "ERROR\t$ns\t$name\tmaxUnavailable=$(echo "$orig" | tr -d '"'),unhealthyPodEvictionPolicy=$(echo "$orig_policy" | tr -d '"'),fluxReconcileAnnotation=$(echo "$orig_flux_reconcile" | tr -d '"')\t$patch_out" >> "$result_file"
       echo "$line" >> "$failure_file"
       failed=$((failed + 1))
     fi
